@@ -1,13 +1,10 @@
-"""
-Connessione al database — compatibile con Streamlit Cloud.
-"""
+"""Connessione al database — compatibile con Streamlit Cloud e VPS."""
 import os
 import streamlit as st
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 Base = declarative_base()
-
 _engine = None
 _SessionLocal = None
 
@@ -32,8 +29,7 @@ def get_engine():
         if url is None:
             st.error(
                 "⚠️ **Database non configurato!**\n\n"
-                "Vai su **Manage app → Settings → Secrets** e aggiungi:\n\n"
-                "```toml\n[database]\n"
+                "Aggiungi nei Secrets:\n\n```toml\n[database]\n"
                 'url = "postgresql://user:pass@host/db?sslmode=require"\n```'
             )
             st.stop()
@@ -58,5 +54,5 @@ def init_db():
     try:
         Base.metadata.create_all(bind=get_engine())
     except Exception as e:
-        st.error(f"⚠️ **Connessione al database fallita.**\n\nErrore: `{e}`")
+        st.error(f"⚠️ **Connessione database fallita.**\n\nErrore: `{e}`")
         st.stop()
