@@ -15,7 +15,7 @@ from utils.sdd_sepa_xml import genera_sdd_xml
 from utils.styles import COMMON_CSS
 from utils.auth import check_auth, logout_button
 from sqlalchemy import extract
-import calendar
+from sqlalchemy.orm import joinedload
 
 st.set_page_config(page_title="Dashboard", page_icon="📊", layout="wide")
 init_db()
@@ -24,32 +24,27 @@ check_auth()
 logout_button()
 
 # === SESSION STATE DEFAULTS ===
-defaults = {
-    "sel_month": date.today().month - 1,
-    "sel_year": date.today().year,
-    "selected_ids": set(),
-    "active_row_id": None,
-    "use_advanced_filter": False,
-    "adv_filter_text": "",
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+if "sel_month" not in st.session_state:
+    st.session_state.sel_month = date.today().month - 1
+if "sel_year" not in st.session_state:
+    st.session_state.sel_year = date.today().year
+if "selected_ids" not in st.session_state:
+    st.session_state.selected_ids = set()
+if "filter_mode" not in st.session_state:
+    st.session_state.filter_mode = "quick"  # "quick" = mesi/anno, "advanced" = filtri avanzati
 
-st.markdown("""
-<div class="page-header">
-<h2>📊 Dashboard Prestazioni</h2>
-</div>""", unsafe_allow_html=True)
+st.markdown('<div class="page-header"><h2>📊 Dashboard Prestazioni</h2></div>',
+            unsafe_allow_html=True)
 
 session = get_session()
 try:
-    # === LOAD LOOKUPS ===
+    # === LOAD LOOKUPS (una sola query ciascuno, cached) ===
     clienti = {c.id: c for c in session.query(Cliente).order_by(Cliente.cognome_ragione_sociale).all()}
     conti = {c.id: c for c in session.query(ContoRicavo).order_by(ContoRicavo.codice).all()}
     fatturanti = {f.id: f for f in session.query(SoggettoFatturante).order_by(SoggettoFatturante.ragione_sociale).all()}
 
-    if not clienti or not conti or not fatturanti:
-        st.warning("⚠️ Devi prima aggiungere almeno un Cliente, un Conto Ricavo e un Soggetto Fatturante.")
+    if not fatturanti:
+        st.warning("⚠️ Aggiungi almeno un Soggetto Fatturante, un Conto Ricavo e un Cliente.")
         st.stop()
 
     # =============================================
@@ -58,129 +53,153 @@ try:
     cols = st.columns(14)
     for i in range(12):
         with cols[i]:
-            is_sel = st.session_state.sel_month == i and not st.session_state.use_advanced_filter
+            is_sel = (st.session_state.sel_month == i
+                      and st.session_state.filter_mode == "quick")
             if st.button(MESI_SHORT[i], key=f"m_{i}", use_container_width=True,
                          type="primary" if is_sel else "secondary"):
                 st.session_state.sel_month = i
-                st.session_state.use_advanced_filter = False
+                st.session_state.filter_mode = "quick"
                 st.rerun()
     with cols[12]:
         if st.button("◀", use_container_width=True):
             st.session_state.sel_year -= 1
-            st.session_state.use_advanced_filter = False
+            st.session_state.filter_mode = "quick"
             st.rerun()
     with cols[13]:
         if st.button("▶", use_container_width=True):
             st.session_state.sel_year += 1
-            st.session_state.use_advanced_filter = False
+            st.session_state.filter_mode = "quick"
             st.rerun()
 
     sel_m = st.session_state.sel_month + 1
     sel_y = st.session_state.sel_year
 
-    # Banner mese/anno (solo se non c'è filtro avanzato attivo)
-    if not st.session_state.use_advanced_filter:
+    # Banner: mostra solo se filtro rapido attivo
+    if st.session_state.filter_mode == "quick":
         st.markdown(f'<div class="month-banner">{MESI[sel_m-1]} {sel_y}</div>',
                     unsafe_allow_html=True)
 
     # =============================================
-    # RIGA 2: FILTRI con pulsante APPLICA
+    # FILTRI AVANZATI (alternativi ai pulsanti mese)
     # =============================================
-    with st.expander("🔍 Filtri avanzati", expanded=st.session_state.use_advanced_filter):
+    with st.expander("🔍 Filtri avanzati", expanded=(st.session_state.filter_mode == "advanced")):
         fc1, fc2, fc3 = st.columns(3)
-        fc = fc1.selectbox("Cliente", ["Tutti"] + [c.denominazione for c in clienti.values()], key="flt_cl")
-        fcr = fc2.selectbox("Conto Ricavo", ["Tutti"] + [f"{c.codice} - {c.descrizione}" for c in conti.values()], key="flt_cr")
-        ff = fc3.selectbox("Fatturante", ["Tutti"] + [f.ragione_sociale for f in fatturanti.values()], key="flt_ft")
+        flt_cl = fc1.selectbox("Cliente", ["Tutti"] + [c.denominazione for c in clienti.values()],
+                               key="flt_cl")
+        flt_cr = fc2.selectbox("Conto Ricavo",
+                               ["Tutti"] + [f"{c.codice} - {c.descrizione}" for c in conti.values()],
+                               key="flt_cr")
+        flt_ft = fc3.selectbox("Fatturante",
+                               ["Tutti"] + [f.ragione_sociale for f in fatturanti.values()],
+                               key="flt_ft")
 
         fd1, fd2, fd3 = st.columns(3)
-        fcred = fd1.selectbox("Stato fatturazione", ["Tutti","Con credito","Fatturato","Non fatturato"], key="flt_stato")
-        fp = fd2.selectbox("Periodicità", ["Tutte"] + PERIODICITA_OPTIONS, key="flt_per")
-        date_text = fd3.text_input("📅 Filtro data",
-            placeholder="es: 2026, 02/2026, febbraio 2026, >01/01/2026",
-            help="Formati: 2026 | 02/2026 | febbraio 2026 | 15/02/2026 | >01/01/2026 | <31/12/2026 | 01/01/2026-31/03/2026",
+        flt_stato = fd1.selectbox("Stato fatturazione",
+                                  ["Tutti", "Fatturato", "Non fatturato"], key="flt_stato")
+        flt_per = fd2.selectbox("Periodicità", ["Tutte"] + PERIODICITA_OPTIONS, key="flt_per")
+        flt_date = fd3.text_input("📅 Filtro data",
+            placeholder="2026, 02/2026, febbraio 2026, >01/01/2026, 01/01-31/03/2026",
+            help="Formati: 2026 | 02/2026 | febbraio 2026 | 15/02/2026 | >dd/mm/yyyy | <dd/mm/yyyy | dd/mm/yyyy-dd/mm/yyyy | */2/2026",
             key="flt_date")
 
-        raggr = fd1.selectbox("Raggruppa per", ["Nessuno","Cliente","Conto Ricavo","Fatturante","Fattura"], key="flt_raggr")
-
-        # Salva/Carica filtri
+        # Salva / Carica filtri
         sf1, sf2, sf3 = st.columns([2, 3, 2])
         if sf1.button("🔍 Applica filtri", type="primary", use_container_width=True):
-            st.session_state.use_advanced_filter = True
+            st.session_state.filter_mode = "advanced"
             st.rerun()
 
-        # Salva filtro
-        saved_name = sf2.text_input("Nome filtro", placeholder="es: Prestazioni bilanci", key="sf_name",
-                                    label_visibility="collapsed")
+        saved_name = sf2.text_input("Nome filtro", placeholder="es: Prestazioni bilanci",
+                                    key="sf_name", label_visibility="collapsed")
         if sf3.button("💾 Salva filtro", use_container_width=True) and saved_name:
-            filtri = {"cliente": fc, "conto": fcr, "fatturante": ff, "stato": fcred,
-                      "periodicita": fp, "data": date_text, "raggruppamento": raggr}
+            filtri = {"cliente": flt_cl, "conto": flt_cr, "fatturante": flt_ft,
+                      "stato": flt_stato, "periodicita": flt_per, "data": flt_date}
             session.add(SavedFilter(user_id=st.session_state.user_id, nome=saved_name, filtri=filtri))
             session.commit()
-            st.success(f"Filtro '{saved_name}' salvato!")
+            st.success(f"✅ Filtro '{saved_name}' salvato!")
             st.rerun()
 
-        # Carica filtri salvati
         saved = session.query(SavedFilter).filter(
             SavedFilter.user_id == st.session_state.user_id
         ).order_by(SavedFilter.nome).all()
         if saved:
-            sl1, sl2 = st.columns([4, 1])
+            sl1, sl2, sl3 = st.columns([3, 1, 1])
             sel_filter = sl1.selectbox("📂 Filtri salvati",
-                [""] + [f.nome for f in saved], key="load_filter")
+                                       [""] + [f.nome for f in saved], key="load_filter")
             if sel_filter:
                 sf_obj = next((f for f in saved if f.nome == sel_filter), None)
-                if sf_obj and sl2.button("📂 Carica"):
-                    f = sf_obj.filtri
-                    st.session_state.flt_cl = f.get("cliente", "Tutti")
-                    st.session_state.flt_cr = f.get("conto", "Tutti")
-                    st.session_state.flt_ft = f.get("fatturante", "Tutti")
-                    st.session_state.flt_stato = f.get("stato", "Tutti")
-                    st.session_state.flt_per = f.get("periodicita", "Tutte")
-                    st.session_state.flt_date = f.get("data", "")
-                    st.session_state.flt_raggr = f.get("raggruppamento", "Nessuno")
-                    st.session_state.use_advanced_filter = True
-                    st.rerun()
+                if sf_obj:
+                    if sl2.button("📂 Carica"):
+                        f = sf_obj.filtri
+                        st.session_state.flt_cl = f.get("cliente", "Tutti")
+                        st.session_state.flt_cr = f.get("conto", "Tutti")
+                        st.session_state.flt_ft = f.get("fatturante", "Tutti")
+                        st.session_state.flt_stato = f.get("stato", "Tutti")
+                        st.session_state.flt_per = f.get("periodicita", "Tutte")
+                        st.session_state.flt_date = f.get("data", "")
+                        st.session_state.filter_mode = "advanced"
+                        st.rerun()
+                    if sl3.button("🗑️ Elimina filtro"):
+                        session.delete(sf_obj)
+                        session.commit()
+                        st.rerun()
 
-        if st.button("↩️ Reset filtri", use_container_width=False):
-            st.session_state.use_advanced_filter = False
+        if st.button("↩️ Torna a filtro mese/anno"):
+            st.session_state.filter_mode = "quick"
             st.rerun()
 
     # =============================================
-    # QUERY con filtri
+    # QUERY PRESTAZIONI (ottimizzata con joinedload)
     # =============================================
-    q = session.query(Prestazione)
+    q = session.query(Prestazione).options(
+        joinedload(Prestazione.cliente),
+        joinedload(Prestazione.conto_ricavo),
+        joinedload(Prestazione.fatturante),
+        joinedload(Prestazione.fattura),
+        joinedload(Prestazione.incassi),
+    )
 
-    # Filtro data: se avanzato attivo, usa il campo data; altrimenti mese/anno rapido
-    date_filter_parsed = parse_date_filter(date_text) if st.session_state.use_advanced_filter else None
+    if st.session_state.filter_mode == "advanced":
+        # Filtri avanzati: NO filtro mese/anno rapido
+        st.markdown('<div class="month-banner">🔍 Filtro avanzato attivo</div>',
+                    unsafe_allow_html=True)
 
-    if date_filter_parsed and st.session_state.use_advanced_filter:
-        q = apply_date_filter(q, Prestazione.data_inizio, date_filter_parsed)
-        st.markdown(f'<div class="month-banner">🔍 Filtro avanzato attivo</div>', unsafe_allow_html=True)
+        # Filtro data testuale
+        date_filter_parsed = parse_date_filter(flt_date)
+        if date_filter_parsed:
+            q = apply_date_filter(q, Prestazione.data_inizio, date_filter_parsed)
+
+        # Filtri aggiuntivi
+        if flt_cl != "Tutti":
+            cid = next((c.id for c in clienti.values() if c.denominazione == flt_cl), None)
+            if cid:
+                q = q.filter(Prestazione.cliente_id == cid)
+        if flt_cr != "Tutti":
+            cod = flt_cr.split(" - ")[0]
+            crid = next((c.id for c in conti.values() if c.codice == cod), None)
+            if crid:
+                q = q.filter(Prestazione.conto_ricavo_id == crid)
+        if flt_ft != "Tutti":
+            fid = next((f.id for f in fatturanti.values() if f.ragione_sociale == flt_ft), None)
+            if fid:
+                q = q.filter(Prestazione.fatturante_id == fid)
+        if flt_per != "Tutte":
+            q = q.filter(Prestazione.periodicita == flt_per)
+        if flt_stato == "Fatturato":
+            q = q.filter(Prestazione.fattura_id.isnot(None))
+        elif flt_stato == "Non fatturato":
+            q = q.filter(Prestazione.fattura_id.is_(None))
     else:
+        # Filtro rapido mese/anno
         q = q.filter(
             extract("month", Prestazione.data_inizio) == sel_m,
             extract("year", Prestazione.data_inizio) == sel_y
         )
 
-    # Filtri aggiuntivi (sempre attivi)
-    if fc != "Tutti":
-        cid = next((c.id for c in clienti.values() if c.denominazione == fc), None)
-        if cid: q = q.filter(Prestazione.cliente_id == cid)
-    if fcr != "Tutti":
-        cod = fcr.split(" - ")[0]
-        crid = next((c.id for c in conti.values() if c.codice == cod), None)
-        if crid: q = q.filter(Prestazione.conto_ricavo_id == crid)
-    if ff != "Tutti":
-        fid = next((f.id for f in fatturanti.values() if f.ragione_sociale == ff), None)
-        if fid: q = q.filter(Prestazione.fatturante_id == fid)
-    if fp != "Tutte":
-        q = q.filter(Prestazione.periodicita == fp)
-    if fcred == "Fatturato":
-        q = q.filter(Prestazione.fattura_id.isnot(None))
-    elif fcred == "Non fatturato":
-        q = q.filter(Prestazione.fattura_id.is_(None))
-
     prestazioni = q.order_by(Prestazione.data_inizio, Prestazione.cliente_id).all()
+
+    # Pulisci selezione: rimuovi ID non più nell'elenco corrente
+    valid_ids = {p.id for p in prestazioni}
+    st.session_state.selected_ids = st.session_state.selected_ids & valid_ids
 
     # =============================================
     # METRICHE
@@ -198,203 +217,265 @@ try:
     m5.metric("Residuo", format_currency(tot - inc))
 
     # =============================================
-    # PULSANTI AZIONE
+    # PULSANTI AZIONE (riga 1 e 2)
     # =============================================
     st.markdown("---")
-    # Riga 1: CRUD
-    a1, a2, a3, a4, a5, a6, a7, a8 = st.columns(8)
-    btn_new = a1.button("➕ Nuova", use_container_width=True, help="Apre nuova scheda")
-    btn_del = a2.button("🗑️ Elimina", use_container_width=True)
-    btn_dup = a3.button("📋 Duplica", use_container_width=True)
-    btn_m = a4.button("+1 Mese", use_container_width=True)
-    btn_t = a5.button("+1 Trim.", use_container_width=True)
-    btn_s = a6.button("+1 Sem.", use_container_width=True)
-    btn_a = a7.button("+1 Anno", use_container_width=True)
-    btn_emetti = a8.button("📄 Emetti Fatt.", use_container_width=True, type="primary")
+    a1, a2, a3, a4, a5, a6 = st.columns(6)
+    btn_del = a1.button("🗑️ Elimina", use_container_width=True)
+    btn_dup = a2.button("📋 Duplica", use_container_width=True)
+    btn_m = a3.button("+1 Mese", use_container_width=True)
+    btn_t = a4.button("+1 Trim.", use_container_width=True)
+    btn_s = a5.button("+1 Sem.", use_container_width=True)
+    btn_a = a6.button("+1 Anno", use_container_width=True)
 
-    # Riga 2: Incasso, SDD, XML
     b1, b2, b3, b4 = st.columns(4)
-    btn_incassa = b1.button("💰 Incassa i selezionati", use_container_width=True)
-    btn_sdd = b2.button("🏦 Crea SDD SEPA", use_container_width=True)
-    btn_xml = b3.button("📋 Genera XML", use_container_width=True)
-    btn_conf_sdd = b4.button("✅ Conferma SDD", use_container_width=True)
-
-    # Nuova prestazione: apre link in nuova scheda
-    if btn_new:
-        params = f"?month={sel_m}&year={sel_y}"
-        st.markdown(
-            f'<script>window.open("/Nuova_Prestazione{params}", "_blank");</script>',
-            unsafe_allow_html=True)
-        st.info("📌 Si apre una nuova scheda per creare la prestazione.")
+    btn_emetti = b1.button("📄 Emetti Fattura", use_container_width=True, type="primary")
+    btn_incassa = b2.button("💰 Incassa selez.", use_container_width=True)
+    btn_sdd = b3.button("🏦 Crea SDD SEPA", use_container_width=True)
+    btn_xml = b4.button("📋 Genera XML", use_container_width=True)
 
     st.markdown("---")
 
     # =============================================
-    # TABELLA PRESTAZIONI con checkbox
+    # SELEZIONA TUTTO / DESELEZIONA + RAGGRUPPAMENTO
+    # =============================================
+    sa1, sa2, sa3, sa4 = st.columns([1, 1, 2, 4])
+    if sa1.button("☑️ Selez. tutto", use_container_width=True):
+        st.session_state.selected_ids = {p.id for p in prestazioni}
+        st.rerun()
+    if sa2.button("⬜ Deselez. tutto", use_container_width=True):
+        st.session_state.selected_ids = set()
+        st.rerun()
+
+    RAGGRUPPAMENTI = [
+        "Conto Ricavo", "Nessuno", "Fatturante", "Periodicità",
+        "Fatturate/Non fatturate", "Incassate/Non incassate"
+    ]
+    raggruppamento = sa3.selectbox("Raggruppa per", RAGGRUPPAMENTI, key="raggr",
+                                   label_visibility="collapsed")
+    sa4.markdown(f"**{len(st.session_state.selected_ids)}** selezionate su **{len(prestazioni)}**")
+
+    # Link nuova prestazione
+    st.markdown(
+        f'<a href="/Nuova_Prestazione?month={sel_m}&year={sel_y}" target="_blank" '
+        f'style="display:inline-block;background:#3b82f6;color:white;padding:6px 16px;'
+        f'border-radius:6px;text-decoration:none;font-weight:600;font-size:0.9rem;">'
+        f'➕ Nuova Prestazione (nuova scheda)</a>', unsafe_allow_html=True)
+
+    # =============================================
+    # TABELLA PRESTAZIONI
     # =============================================
     if not prestazioni:
         st.info("Nessuna prestazione trovata con i filtri correnti.")
     else:
-        # Build dataframe
-        rows = []
-        for p in prestazioni:
-            cl = clienti.get(p.cliente_id)
-            cr = conti.get(p.conto_ricavo_id)
-            ft = fatturanti.get(p.fatturante_id)
-            fa = session.query(Fattura).get(p.fattura_id) if p.fattura_id else None
-            pl = calc_periodicity_label(p.periodicita, p.data_inizio)
-            rows.append({
-                "id": p.id,
-                "Sel": p.id in st.session_state.selected_ids,
-                "Esigibilità": f"{p.data_inizio.strftime('%d/%m/%Y')} → {p.data_fine.strftime('%d/%m/%Y')}",
-                "Cliente": cl.denominazione if cl else "-",
-                "Descrizione": p.descrizione + pl,
-                "Importo": float(p.importo_unitario),
-                "IVA%": p.aliquota_iva,
-                "Totale": p.totale,
-                "Incassato": p.totale_incassato,
-                "Residuo": p.credito_residuo,
-                "Mod.": p.modalita_incasso[:3],
-                "Fatturante": ft.ragione_sociale if ft else "-",
-                "Fattura": f"{fa.numero}/{fa.anno}" if fa else "—",
-                "Per.": p.periodicita[:3],
-            })
+        # Funzione raggruppamento
+        def get_group_key(p):
+            if raggruppamento == "Conto Ricavo":
+                cr = conti.get(p.conto_ricavo_id)
+                return f"{cr.codice} - {cr.descrizione}" if cr else "—"
+            elif raggruppamento == "Fatturante":
+                ft = fatturanti.get(p.fatturante_id)
+                return ft.ragione_sociale if ft else "—"
+            elif raggruppamento == "Periodicità":
+                return p.periodicita
+            elif raggruppamento == "Fatturate/Non fatturate":
+                return "✅ Fatturate" if p.is_fatturata else "⏳ Non fatturate"
+            elif raggruppamento == "Incassate/Non incassate":
+                return "✅ Incassate" if p.credito_residuo <= 0 else "⏳ Non incassate"
+            else:
+                return None
 
-        df = pd.DataFrame(rows)
+        # Raggruppa
+        if raggruppamento != "Nessuno":
+            groups = {}
+            for p in prestazioni:
+                k = get_group_key(p)
+                groups.setdefault(k, []).append(p)
+        else:
+            groups = {"": prestazioni}
 
-        # CSS per righe alternate e riga attiva
-        st.markdown("""
-        <style>
-        [data-testid="stDataEditor"] [data-testid="data-grid-canvas"]
-            div[data-row-index]:nth-child(even) { background-color: #f0f9ff !important; }
-        [data-testid="stDataEditor"] [data-testid="data-grid-canvas"]
-            div[data-row-index]:nth-child(odd) { background-color: #ffffff !important; }
-        </style>
-        """, unsafe_allow_html=True)
+        # CSS righe alternate
+        st.markdown("""<style>
+        .alt-table { width:100%; border-collapse:collapse; font-size:0.82rem; }
+        .alt-table th { background:#1e293b; color:white; padding:6px 5px; text-align:left;
+            font-size:0.78rem; font-weight:600; position:sticky; top:0; z-index:5; }
+        .alt-table td { padding:5px 5px; border-bottom:1px solid #e2e8f0; }
+        .alt-table tr.r0 { background:#ffffff; }
+        .alt-table tr.r1 { background:#f0f9ff; }
+        .alt-table tr:hover { background:#dbeafe !important; }
+        .alt-table .money { text-align:right; font-family:monospace; white-space:nowrap; }
+        .alt-table .center { text-align:center; }
+        .grp-header { background:#e2e8f0; padding:6px 10px; border-radius:6px;
+            font-weight:bold; margin:8px 0 4px; font-size:0.9rem; }
+        .badge-si { background:#dcfce7; color:#166534; padding:1px 5px; border-radius:3px; font-size:0.75rem; }
+        .badge-no { background:#fef3c7; color:#92400e; padding:1px 5px; border-radius:3px; font-size:0.75rem; }
+        @media(max-width:768px) {
+            .alt-table { font-size:0.72rem; }
+            .alt-table th, .alt-table td { padding:3px 2px; }
+            .hide-m { display:none !important; }
+        }
+        </style>""", unsafe_allow_html=True)
 
-        # Select All / Deselect All
-        sa1, sa2, sa3 = st.columns([1, 1, 6])
-        if sa1.button("☑️ Seleziona tutto", use_container_width=True):
-            st.session_state.selected_ids = {p.id for p in prestazioni}
-            st.rerun()
-        if sa2.button("⬜ Deseleziona tutto", use_container_width=True):
-            st.session_state.selected_ids = set()
-            st.rerun()
-        sa3.markdown(f"**{len(st.session_state.selected_ids)}** selezionate su {len(prestazioni)}")
+        # Render dei gruppi
+        for group_name, group_prests in groups.items():
+            if group_name:
+                tot_g = sum(p.totale for p in group_prests)
+                st.markdown(f'<div class="grp-header">{group_name} — '
+                            f'{len(group_prests)} record — {format_currency(tot_g)}</div>',
+                            unsafe_allow_html=True)
 
-        # Data editor con checkbox
-        display_cols = ["Sel", "Esigibilità", "Cliente", "Descrizione", "Importo", "IVA%",
-                        "Totale", "Incassato", "Residuo", "Mod.", "Fatturante", "Fattura", "Per."]
+            # Checkbox per selezione — uso st.checkbox individuale
+            # Ma per performance con molte righe, uso data_editor
+            rows = []
+            for p in group_prests:
+                cl = p.cliente
+                cr = p.conto_ricavo
+                ft = p.fatturante
+                fa = p.fattura
+                pl = calc_periodicity_label(p.periodicita, p.data_inizio)
+                rows.append({
+                    "_id": p.id,
+                    "✓": p.id in st.session_state.selected_ids,
+                    "Data": p.data_inizio.strftime("%d/%m/%Y") if p.data_inizio else "",
+                    "Cliente": cl.denominazione if cl else "-",
+                    "Descrizione": (p.descrizione + pl)[:50],
+                    "Importo": float(p.importo_unitario or 0),
+                    "IVA%": p.aliquota_iva,
+                    "Totale": round(p.totale, 2),
+                    "Incassato": round(p.totale_incassato, 2),
+                    "Residuo": round(p.credito_residuo, 2),
+                    "Mod": (p.modalita_incasso or "")[:4],
+                    "Fatt.": f"{fa.numero}/{fa.anno}" if fa else "—",
+                    "Per": (p.periodicita or "")[:3],
+                })
 
-        edited_df = st.data_editor(
-            df[display_cols],
-            column_config={
-                "Sel": st.column_config.CheckboxColumn("✓", width=40, default=False),
-                "Importo": st.column_config.NumberColumn(format="€ %.2f", width=90),
-                "Totale": st.column_config.NumberColumn(format="€ %.2f", width=90),
-                "Incassato": st.column_config.NumberColumn(format="€ %.2f", width=90),
-                "Residuo": st.column_config.NumberColumn(format="€ %.2f", width=90),
-                "IVA%": st.column_config.NumberColumn(width=50),
-                "Mod.": st.column_config.TextColumn(width=45),
-                "Per.": st.column_config.TextColumn(width=45),
-            },
-            disabled=["Esigibilità", "Cliente", "Descrizione", "Importo", "IVA%",
-                       "Totale", "Incassato", "Residuo", "Mod.", "Fatturante", "Fattura", "Per."],
-            hide_index=True,
-            use_container_width=True,
-            height=min(600, 40 + len(df) * 35),
-            key="prest_table"
-        )
+            df = pd.DataFrame(rows)
 
-        # Sincronizza selezione
-        if edited_df is not None:
-            new_sel = set()
-            for i, row in edited_df.iterrows():
-                if row.get("Sel", False):
-                    new_sel.add(df.iloc[i]["id"])
-            st.session_state.selected_ids = new_sel
+            # Chiave unica per data_editor per gruppo
+            safe_key = f"tbl_{hash(group_name) % 100000}"
 
-        n_sel = len(st.session_state.selected_ids)
+            edited = st.data_editor(
+                df.drop(columns=["_id"]),
+                column_config={
+                    "✓": st.column_config.CheckboxColumn("✓", width=35, default=False),
+                    "Data": st.column_config.TextColumn(width=85),
+                    "Cliente": st.column_config.TextColumn(width=150),
+                    "Descrizione": st.column_config.TextColumn(width=200),
+                    "Importo": st.column_config.NumberColumn(format="€ %.2f", width=85),
+                    "IVA%": st.column_config.NumberColumn(width=45),
+                    "Totale": st.column_config.NumberColumn(format="€ %.2f", width=85),
+                    "Incassato": st.column_config.NumberColumn(format="€ %.2f", width=85),
+                    "Residuo": st.column_config.NumberColumn(format="€ %.2f", width=85),
+                    "Mod": st.column_config.TextColumn(width=42),
+                    "Fatt.": st.column_config.TextColumn(width=60),
+                    "Per": st.column_config.TextColumn(width=40),
+                },
+                disabled=["Data", "Cliente", "Descrizione", "Importo", "IVA%",
+                           "Totale", "Incassato", "Residuo", "Mod", "Fatt.", "Per"],
+                hide_index=True,
+                use_container_width=True,
+                height=min(500, 38 + len(df) * 35),
+                key=safe_key,
+            )
+
+            # Sincronizza checkbox → selected_ids
+            if edited is not None:
+                for i, row in edited.iterrows():
+                    pid = df.iloc[i]["_id"]
+                    if row.get("✓", False):
+                        st.session_state.selected_ids.add(pid)
+                    else:
+                        st.session_state.selected_ids.discard(pid)
 
         # =============================================
         # AZIONI PER SINGOLA RIGA (edit / incassi)
         # =============================================
-        st.markdown("#### 🔧 Azioni su singola prestazione")
-        row_options = {p.id: f"#{p.id} — {clienti.get(p.cliente_id, type('',(),{'denominazione':'-'})()).denominazione} — {p.descrizione}" for p in prestazioni}
-        sel_row_id = st.selectbox("Seleziona prestazione:", list(row_options.keys()),
-            format_func=lambda x: row_options[x], key="sel_row_action")
+        st.markdown("#### 🔧 Azione rapida su singola prestazione")
+        prest_opts = {p.id: f"#{p.id} — {p.cliente.denominazione if p.cliente else '-'} — {p.descrizione}"
+                      for p in prestazioni}
+        sel_row_id = st.selectbox("Seleziona:", list(prest_opts.keys()),
+                                  format_func=lambda x: prest_opts[x], key="sel_row")
 
         if sel_row_id:
-            rc1, rc2, rc3 = st.columns(3)
-            # Edit link (nuova scheda)
+            rc1, rc2 = st.columns(2)
             rc1.markdown(
                 f'<a href="/Modifica_Prestazione?id={sel_row_id}" target="_blank" '
                 f'style="display:block;text-align:center;background:#dbeafe;color:#1d4ed8;'
                 f'padding:8px;border-radius:8px;text-decoration:none;font-weight:bold;">'
-                f'✏️ Modifica</a>', unsafe_allow_html=True)
-            # Incassi link (nuova scheda)
+                f'✏️ Modifica (nuova scheda)</a>', unsafe_allow_html=True)
             rc2.markdown(
                 f'<a href="/Incassi_Prestazione?id={sel_row_id}" target="_blank" '
                 f'style="display:block;text-align:center;background:#dcfce7;color:#166534;'
                 f'padding:8px;border-radius:8px;text-decoration:none;font-weight:bold;">'
-                f'💰 Incassi</a>', unsafe_allow_html=True)
-            rc3.markdown(
-                f'<a href="/Nuova_Prestazione?month={sel_m}&year={sel_y}" target="_blank" '
-                f'style="display:block;text-align:center;background:#fef3c7;color:#92400e;'
-                f'padding:8px;border-radius:8px;text-decoration:none;font-weight:bold;">'
-                f'➕ Nuova Prestazione</a>', unsafe_allow_html=True)
+                f'💰 Incassi (nuova scheda)</a>', unsafe_allow_html=True)
 
     # =============================================
-    # AZIONI MASSIVE (richiedono selezione)
+    # AZIONI MASSIVE
     # =============================================
     sids = st.session_state.selected_ids
 
-    def _check_selection():
+    def _no_sel():
         if not sids:
             st.warning("⚠️ Nessuna prestazione selezionata.")
-            return False
-        return True
+            return True
+        return False
+
+    def _load_selected():
+        """Carica le prestazioni selezionate con gestione sicura."""
+        if not sids:
+            return []
+        id_list = [int(i) for i in sids]
+        return session.query(Prestazione).options(
+            joinedload(Prestazione.cliente),
+            joinedload(Prestazione.incassi),
+        ).filter(Prestazione.id.in_(id_list)).all()
 
     # --- ELIMINA ---
-    if btn_del:
-        if _check_selection():
-            st.session_state["confirm_delete"] = True
+    if btn_del and not _no_sel():
+        st.session_state["confirm_action"] = "delete"
 
-    if st.session_state.get("confirm_delete"):
-        st.warning(f"⚠️ **Confermi l'eliminazione di {len(sids)} prestazioni?** Questa azione è irreversibile.")
+    if st.session_state.get("confirm_action") == "delete":
+        st.warning(f"⚠️ **Eliminare {len(sids)} prestazioni?** Azione irreversibile.")
         cd1, cd2 = st.columns(2)
-        if cd1.button("✅ Sì, elimina", type="primary", key="conf_del_yes"):
-            session.query(Incasso).filter(
-                Incasso.prestazione_id.in_(sids)).delete(synchronize_session=False)
-            session.query(Prestazione).filter(
-                Prestazione.id.in_(sids)).delete(synchronize_session=False)
+        if cd1.button("✅ Sì, elimina", type="primary", key="yes_del"):
+            id_list = [int(i) for i in sids]
+            session.query(Incasso).filter(Incasso.prestazione_id.in_(id_list)).delete(synchronize_session=False)
+            session.query(Prestazione).filter(Prestazione.id.in_(id_list)).delete(synchronize_session=False)
             session.commit()
             st.session_state.selected_ids = set()
-            st.session_state.pop("confirm_delete", None)
+            st.session_state.pop("confirm_action", None)
             st.success("✅ Eliminate!")
             st.rerun()
-        if cd2.button("❌ Annulla", key="conf_del_no"):
-            st.session_state.pop("confirm_delete", None)
+        if cd2.button("❌ Annulla", key="no_del"):
+            st.session_state.pop("confirm_action", None)
             st.rerun()
 
-    # --- DUPLICA ---
-    if btn_dup:
-        if _check_selection():
-            st.session_state["confirm_dup"] = "same"
-    for btn, per_name, per_key in [(btn_m, "Mensile", "dup_m"), (btn_t, "Trimestrale", "dup_t"),
-                                    (btn_s, "Semestrale", "dup_s"), (btn_a, "Annuale", "dup_a")]:
-        if btn:
-            if _check_selection():
-                st.session_state["confirm_dup"] = per_name
+    # --- DUPLICA (stessa data o spostata) ---
+    dup_period = None
+    if btn_dup and not _no_sel():
+        dup_period = "same"
+    elif btn_m and not _no_sel():
+        dup_period = "Mensile"
+    elif btn_t and not _no_sel():
+        dup_period = "Trimestrale"
+    elif btn_s and not _no_sel():
+        dup_period = "Semestrale"
+    elif btn_a and not _no_sel():
+        dup_period = "Annuale"
 
-    if st.session_state.get("confirm_dup"):
-        period = st.session_state["confirm_dup"]
+    if dup_period:
+        st.session_state["confirm_action"] = f"dup_{dup_period}"
+
+    dup_key = st.session_state.get("confirm_action", "")
+    if dup_key.startswith("dup_"):
+        period = dup_key[4:]
         label = "identiche" if period == "same" else f"spostate +1 {period.lower()}"
         st.info(f"📋 **Duplicare {len(sids)} prestazioni ({label})?**")
         dd1, dd2 = st.columns(2)
-        if dd1.button("✅ Sì, duplica", type="primary", key="conf_dup_yes"):
-            new_ids = []
-            for p in session.query(Prestazione).filter(Prestazione.id.in_(sids)).all():
+        if dd1.button("✅ Sì, duplica", type="primary", key="yes_dup"):
+            psel = _load_selected()
+            new_ids = set()
+            for p in psel:
                 di = p.data_inizio if period == "same" else add_period(p.data_inizio, period)
                 df_new = p.data_fine if period == "same" else add_period(p.data_fine, period)
                 new_p = Prestazione(
@@ -405,154 +486,138 @@ try:
                     modalita_incasso=p.modalita_incasso, note=p.note or "")
                 session.add(new_p)
                 session.flush()
-                new_ids.append(new_p.id)
+                new_ids.add(new_p.id)
             session.commit()
-            st.session_state.selected_ids = set(new_ids)  # Nuove diventano attive
-            st.session_state.pop("confirm_dup", None)
+            st.session_state.selected_ids = new_ids
+            st.session_state.pop("confirm_action", None)
             st.success(f"✅ {len(new_ids)} prestazioni duplicate!")
             st.rerun()
-        if dd2.button("❌ Annulla", key="conf_dup_no"):
-            st.session_state.pop("confirm_dup", None)
+        if dd2.button("❌ Annulla", key="no_dup"):
+            st.session_state.pop("confirm_action", None)
             st.rerun()
 
     # --- EMETTI FATTURE ---
-    if btn_emetti:
-        if _check_selection():
-            psel = session.query(Prestazione).filter(
-                Prestazione.id.in_(sids)).all()
-
-            # Controllo: nessuna deve avere già una fattura
-            gia_fatt = [p for p in psel if p.is_fatturata]
-            if gia_fatt:
-                st.error(f"⚠️ {len(gia_fatt)} prestazioni selezionate hanno GIÀ una fattura. "
-                         "Deselezionale prima di procedere.")
+    if btn_emetti and not _no_sel():
+        psel = _load_selected()
+        gia_fatt = [p for p in psel if p.is_fatturata]
+        if gia_fatt:
+            st.error(f"⚠️ {len(gia_fatt)} prestazioni hanno GIÀ una fattura. Deselezionale.")
+        else:
+            fatt_ids = set(p.fatturante_id for p in psel)
+            if len(fatt_ids) > 1:
+                nomi = [fatturanti[fid].ragione_sociale for fid in fatt_ids if fid in fatturanti]
+                st.error(f"⚠️ Fatturanti diversi: {', '.join(nomi)}. Filtra prima per fatturante.")
             else:
-                # Controllo: stesso fatturante
-                fatt_ids = set(p.fatturante_id for p in psel)
-                if len(fatt_ids) > 1:
-                    nomi = [fatturanti[fid].ragione_sociale for fid in fatt_ids]
-                    st.error(f"⚠️ Le prestazioni selezionate hanno fatturanti diversi: {', '.join(nomi)}. "
-                             "Filtra prima per fatturante.")
-                else:
-                    st.session_state["emetti_preview"] = True
+                st.session_state["confirm_action"] = "emetti"
 
-    if st.session_state.get("emetti_preview"):
-        psel = session.query(Prestazione).filter(
-            Prestazione.id.in_(sids), Prestazione.fattura_id.is_(None)).all()
+    if st.session_state.get("confirm_action") == "emetti":
+        psel = _load_selected()
+        psel = [p for p in psel if not p.is_fatturata]
         if psel:
             st.markdown("### 📄 Anteprima Emissione Fattura")
-            data_em = st.date_input("📅 Data emissione", value=date.today(), key="data_emissione")
+            data_em = st.date_input("📅 Data emissione", value=date.today(), key="dt_em")
 
-            # Raggruppamento per cliente
-            groups = {}
+            groups_fatt = {}
             for p in psel:
-                groups.setdefault(p.cliente_id, []).append(p)
+                groups_fatt.setdefault(p.cliente_id, []).append(p)
 
-            for cid, prests in groups.items():
+            for cid, prests in groups_fatt.items():
                 cl = clienti.get(cid)
                 tot_g = sum(p.totale for p in prests)
                 st.markdown(f"**{cl.denominazione if cl else '-'}** — {len(prests)} righe — "
-                            f"Totale: {format_currency(tot_g)}")
+                            f"{format_currency(tot_g)}")
                 for p in prests:
                     st.caption(f"  • {p.descrizione} — {format_currency(p.importo_unitario)} + IVA {p.aliquota_iva}%")
 
             ef1, ef2 = st.columns(2)
-            if ef1.button("✅ Conferma emissione", type="primary", key="conf_emetti"):
-                fatt_id = next(iter(set(p.fatturante_id for p in psel)))
-                for cid, prests in groups.items():
+            if ef1.button("✅ Conferma emissione", type="primary", key="yes_em"):
+                fatt_id = psel[0].fatturante_id
+                for cid, prests in groups_fatt.items():
                     num = get_next_fattura_number(session, fatt_id, data_em.year)
                     t_imp = sum(float(p.importo_unitario) for p in prests)
                     t_iva = sum(p.importo_iva for p in prests)
                     t_tot = sum(p.totale for p in prests)
                     f = Fattura(numero=num, anno=data_em.year, data=data_em, cliente_id=cid,
-                        fatturante_id=fatt_id, totale_imponibile=Decimal(str(t_imp)),
-                        totale_iva=Decimal(str(t_iva)), totale=Decimal(str(t_tot)))
+                                fatturante_id=fatt_id, totale_imponibile=Decimal(str(t_imp)),
+                                totale_iva=Decimal(str(t_iva)), totale=Decimal(str(t_tot)))
                     session.add(f)
                     session.flush()
                     for p in prests:
                         p.fattura_id = f.id
                 session.commit()
                 st.session_state.selected_ids = set()
-                st.session_state.pop("emetti_preview", None)
-                st.success(f"✅ {len(groups)} fattura/e emessa/e!")
+                st.session_state.pop("confirm_action", None)
+                st.success(f"✅ {len(groups_fatt)} fattura/e emessa/e!")
                 st.rerun()
-            if ef2.button("❌ Annulla", key="conf_emetti_no"):
-                st.session_state.pop("emetti_preview", None)
+            if ef2.button("❌ Annulla", key="no_em"):
+                st.session_state.pop("confirm_action", None)
                 st.rerun()
 
     # --- INCASSA I SELEZIONATI ---
-    if btn_incassa:
-        if _check_selection():
-            st.session_state["incassa_preview"] = True
+    if btn_incassa and not _no_sel():
+        st.session_state["confirm_action"] = "incassa"
 
-    if st.session_state.get("incassa_preview"):
-        psel = session.query(Prestazione).filter(Prestazione.id.in_(sids)).all()
-        psel = [p for p in psel if p.credito_residuo > 0]
-        if not psel:
-            st.warning("Nessuna prestazione selezionata con credito residuo.")
-            st.session_state.pop("incassa_preview", None)
+    if st.session_state.get("confirm_action") == "incassa":
+        psel = _load_selected()
+        psel_cr = [p for p in psel if p.credito_residuo > 0]
+        if not psel_cr:
+            st.warning("Nessuna prestazione con credito residuo.")
+            st.session_state.pop("confirm_action", None)
         else:
             st.markdown("### 💰 Anteprima Incasso")
             ic1, ic2 = st.columns(2)
-            data_inc = ic1.date_input("📅 Data incasso", value=date.today(), key="data_incasso")
-            mod_inc = ic2.selectbox("Modalità", MODALITA_INCASSO_OPTIONS, key="mod_incasso")
+            data_inc = ic1.date_input("📅 Data incasso", value=date.today(), key="dt_inc")
+            mod_inc = ic2.selectbox("Modalità", MODALITA_INCASSO_OPTIONS, key="mod_inc")
 
-            tot_inc = sum(p.credito_residuo for p in psel)
-            st.markdown(f"**{len(psel)} prestazioni — Totale da incassare: {format_currency(tot_inc)}**")
-            for p in psel:
-                cl = clienti.get(p.cliente_id)
+            tot_inc = sum(p.credito_residuo for p in psel_cr)
+            st.markdown(f"**{len(psel_cr)} prestazioni — Totale: {format_currency(tot_inc)}**")
+            for p in psel_cr:
+                cl = p.cliente
                 st.caption(f"  • {cl.denominazione if cl else '-'} — {p.descrizione} — "
                            f"{format_currency(p.credito_residuo)}")
 
             ii1, ii2 = st.columns(2)
-            if ii1.button("✅ Conferma incasso", type="primary", key="conf_incassa"):
-                for p in psel:
+            if ii1.button("✅ Conferma incasso", type="primary", key="yes_inc"):
+                for p in psel_cr:
                     session.add(Incasso(
-                        prestazione_id=p.id, importo=Decimal(str(p.credito_residuo)),
+                        prestazione_id=p.id, importo=Decimal(str(round(p.credito_residuo, 2))),
                         data=data_inc, stato="Confermato", modalita=mod_inc))
                 session.commit()
-                st.session_state.pop("incassa_preview", None)
-                st.success(f"✅ {len(psel)} incassi registrati!")
+                st.session_state.pop("confirm_action", None)
+                st.success(f"✅ {len(psel_cr)} incassi registrati!")
                 st.rerun()
-            if ii2.button("❌ Annulla", key="conf_incassa_no"):
-                st.session_state.pop("incassa_preview", None)
+            if ii2.button("❌ Annulla", key="no_inc"):
+                st.session_state.pop("confirm_action", None)
                 st.rerun()
 
     # --- CREA SDD SEPA ---
-    if btn_sdd:
-        if _check_selection():
-            psel = session.query(Prestazione).filter(Prestazione.id.in_(sids)).all()
-
-            # Controllo: tutte fatturate
-            non_fatt = [p for p in psel if not p.is_fatturata]
-            if non_fatt:
-                st.error(f"⚠️ {len(non_fatt)} prestazioni NON hanno fattura emessa. "
-                         "Emetti prima le fatture per tutte le prestazioni selezionate.")
+    if btn_sdd and not _no_sel():
+        psel = _load_selected()
+        non_fatt = [p for p in psel if not p.is_fatturata]
+        if non_fatt:
+            st.error(f"⚠️ {len(non_fatt)} prestazioni senza fattura. Emetti prima le fatture.")
+        else:
+            fatt_ids = set(p.fatturante_id for p in psel)
+            if len(fatt_ids) > 1:
+                nomi = [fatturanti[fid].ragione_sociale for fid in fatt_ids if fid in fatturanti]
+                st.error(f"⚠️ Fatturanti diversi: {', '.join(nomi)}. Filtra per fatturante.")
             else:
-                # Controllo: stesso fatturante
-                fatt_ids = set(p.fatturante_id for p in psel)
-                if len(fatt_ids) > 1:
-                    nomi = [fatturanti[fid].ragione_sociale for fid in fatt_ids]
-                    st.error(f"⚠️ I fatturanti sono diversi: {', '.join(nomi)}. "
-                             "Filtra prima per fatturante.")
-                else:
-                    st.session_state["sdd_preview"] = True
+                st.session_state["confirm_action"] = "sdd"
 
-    if st.session_state.get("sdd_preview"):
-        psel = session.query(Prestazione).filter(
-            Prestazione.id.in_(sids), Prestazione.fattura_id.isnot(None)).all()
-        psel_sdd = [p for p in psel if p.credito_residuo > 0]
+    if st.session_state.get("confirm_action") == "sdd":
+        psel = _load_selected()
+        psel_sdd = [p for p in psel if p.is_fatturata and p.credito_residuo > 0]
         if not psel_sdd:
             st.warning("Nessuna prestazione con credito residuo.")
-            st.session_state.pop("sdd_preview", None)
+            st.session_state.pop("confirm_action", None)
         else:
             st.markdown("### 🏦 Anteprima Tracciato SDD SEPA")
-            data_add = st.date_input("📅 Data addebito", value=date.today(), key="data_sdd")
+            data_add = st.date_input("📅 Data addebito", value=date.today(), key="dt_sdd")
 
             anomalie = []
             inc_data = []
             for p in psel_sdd:
-                cl = clienti.get(p.cliente_id)
+                cl = p.cliente
                 if not cl:
                     anomalie.append(f"Prestazione #{p.id}: cliente non trovato")
                     continue
@@ -563,16 +628,15 @@ try:
                     anomalie.append(f"{cl.denominazione}: IBAN SDD mancante")
                     continue
                 if not cl.rif_mandato_sdd:
-                    anomalie.append(f"{cl.denominazione}: riferimento mandato SDD mancante")
-
+                    anomalie.append(f"{cl.denominazione}: rif. mandato SDD mancante")
                 inc_data.append({
                     "prestazione": p, "cliente": cl,
-                    "importo": p.credito_residuo,
-                    "prestazione_descrizione": p.descrizione + calc_periodicity_label(p.periodicita, p.data_inizio)
+                    "importo": round(p.credito_residuo, 2),
+                    "prestazione_descrizione": p.descrizione + calc_periodicity_label(p.periodicita, p.data_inizio),
                 })
 
             if anomalie:
-                st.warning("⚠️ **Anomalie riscontrate:**")
+                st.warning("⚠️ **Anomalie:**")
                 for a in anomalie:
                     st.caption(f"  ⚠️ {a}")
 
@@ -581,11 +645,10 @@ try:
                 st.markdown(f"**{len(inc_data)} addebiti — Totale: {format_currency(tot_sdd)}**")
                 for i in inc_data:
                     st.caption(f"  • {i['cliente'].denominazione} — {i['prestazione_descrizione']} — "
-                               f"{format_currency(i['importo'])} — IBAN: {i['cliente'].iban_sdd}")
+                               f"{format_currency(i['importo'])}")
 
                 sd1, sd2 = st.columns(2)
-                if sd1.button("✅ Conferma e genera XML", type="primary", key="conf_sdd"):
-                    # Crea incassi
+                if sd1.button("✅ Conferma e genera XML", type="primary", key="yes_sdd"):
                     for i in inc_data:
                         session.add(Incasso(
                             prestazione_id=i["prestazione"].id,
@@ -593,28 +656,27 @@ try:
                             data=data_add, stato="Caricato da confermare", modalita="SDD SEPA"))
                     session.commit()
 
-                    # Genera XML
-                    fatt_id = next(iter(set(p.fatturante_id for p in psel_sdd)))
+                    fatt_id = psel_sdd[0].fatturante_id
                     ft = fatturanti[fatt_id]
                     xml = genera_sdd_xml(ft, inc_data, data_add)
                     st.download_button("⬇️ Scarica XML SDD SEPA", xml,
-                        f"SDD_{data_add.isoformat()}.xml", "application/xml")
-                    st.session_state.pop("sdd_preview", None)
-                    st.success(f"✅ Tracciato SDD creato per {len(inc_data)} addebiti!")
-                if sd2.button("❌ Annulla", key="conf_sdd_no"):
-                    st.session_state.pop("sdd_preview", None)
+                                       f"SDD_{data_add.isoformat()}.xml", "application/xml")
+                    st.session_state.pop("confirm_action", None)
+                    st.success(f"✅ Tracciato SDD creato!")
+                if sd2.button("❌ Annulla", key="no_sdd"):
+                    st.session_state.pop("confirm_action", None)
                     st.rerun()
             else:
-                st.error("Nessun addebito valido. Risolvi le anomalie sopra.")
-                if st.button("Chiudi", key="sdd_close"):
-                    st.session_state.pop("sdd_preview", None)
+                st.error("Nessun addebito valido.")
+                if st.button("Chiudi", key="close_sdd"):
+                    st.session_state.pop("confirm_action", None)
                     st.rerun()
 
-    # --- GENERA XML ---
+    # --- GENERA XML FATTURE ---
     if btn_xml:
         fno = session.query(Fattura).filter(Fattura.xml_generato == False).all()
         if not fno:
-            st.info("Nessuna fattura da generare.")
+            st.info("Nessuna fattura da esportare in XML.")
         else:
             xml_list = []
             for f in fno:
@@ -631,20 +693,9 @@ try:
             if len(xml_list) == 1:
                 st.download_button("⬇️ Scarica XML", xml_list[0][0], xml_list[0][1], "application/xml")
             elif xml_list:
-                st.download_button(f"⬇️ Scarica ZIP ({len(xml_list)})", genera_zip_fatture(xml_list),
-                    f"fatture.zip", "application/zip")
+                st.download_button(f"⬇️ Scarica ZIP ({len(xml_list)})",
+                                   genera_zip_fatture(xml_list), "fatture.zip", "application/zip")
             st.success(f"✅ {len(xml_list)} XML generati!")
-
-    # --- CONFERMA SDD ---
-    if btn_conf_sdd:
-        u = session.query(Incasso).filter(Incasso.stato == "Caricato da confermare").update(
-            {"stato": "Confermato"}, synchronize_session=False)
-        session.commit()
-        if u:
-            st.success(f"✅ {u} SDD confermati!")
-            st.rerun()
-        else:
-            st.info("Nessun SDD da confermare.")
 
 finally:
     session.close()

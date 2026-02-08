@@ -107,6 +107,9 @@ def init_db():
         engine = get_engine()
         Base.metadata.create_all(bind=engine)
         _migrate_columns()
+        # Crea indici per performance
+        from utils.db_indexes import create_indexes
+        create_indexes(engine)
     except Exception as e:
         st.error(f"⚠️ **Errore database.**\n\nErrore: `{e}`")
         st.stop()
